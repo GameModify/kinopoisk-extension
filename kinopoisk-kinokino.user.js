@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Кинопоиск → Kinokino — Смотреть бесплатно
 // @namespace    https://github.com/GameModify/kinopoisk-extension
-// @version      1.3.0
+// @version      1.3.1
 // @description  Перетаскиваемая кнопка просмотра с сохранением положения на страницах Кинопоиска.
 // @match        https://www.kinopoisk.ru/*
 // @match        https://kinopoisk.ru/*
@@ -60,19 +60,25 @@
       -webkit-tap-highlight-color: transparent;
     }
     a::before { content: "▶"; font-size: 11px; }
-    a:hover { background: #3b3b3b; border-color: #929292; }
+    a:hover { --kp-bg: #3b3b3b; --kp-border: #929292; }
     a:focus-visible { outline: 2px solid #fff; outline-offset: 3px; }
-    a:active { background: #222; cursor: grabbing; }
+    a:active { --kp-bg: #222; --kp-cursor: grabbing; }
   `;
 
   let host;
   let link;
   let frame = null;
-  let timer;
+  let timer = null;
+  let refreshTimer = null;
   let hostObserver;
   let position = null;
   let drag = null;
   let suppressClick = false;
+  let positionRefreshPending = true;
+  let positionWritePending = false;
+  let menusRegistered = false;
+  const ruleStyle = document.createElement("span").style;
+  const canonicalRules = new Map();
 
   function readPosition() {
     const value = GM_getValue(POSITION_KEY, null);
@@ -129,7 +135,7 @@
         ? 0
         : Math.min(1, Math.max(0, (value - box.min) / (max - box.min)));
     position = { x: ratio(rect.left, box.maxX), y: ratio(rect.top, box.maxY) };
-    GM_setValue(POSITION_KEY, position);
+    persistPosition(position);
   }
 
   function releaseDragPointer(pointerId) {
@@ -197,34 +203,30 @@
 
   function resetPosition() {
     cancelDrag();
-    position = null;
-    GM_setValue(POSITION_KEY, null);
+    persistPosition(null);
     applyPosition();
   }
 
-  function restoreVisibility() {
-    if (host.hasAttribute("hidden")) host.removeAttribute("hidden");
-    const rules = {
-      display: "block",
-      visibility: "visible",
-      opacity: "1",
-      position: "fixed",
-      height: "auto",
-      "max-height": "none",
-      overflow: "visible",
-      "pointer-events": "auto",
-    };
+  function setRules(element, rules, priority = "") {
     for (const [name, value] of Object.entries(rules)) {
+      const key = `${name}:${value}`;
+      if (!canonicalRules.has(key)) {
+        ruleStyle.setProperty(name, value);
+        canonicalRules.set(key, ruleStyle.getPropertyValue(name));
+      }
       if (
-        host.style.getPropertyValue(name) !== value ||
-        host.style.getPropertyPriority(name) !== "important"
+        element.style.getPropertyValue(name) !== canonicalRules.get(key) ||
+        element.style.getPropertyPriority(name) !== priority
       ) {
-        host.style.setProperty(name, value, "important");
+        element.style.setProperty(name, value, priority);
       }
     }
   }
 
-  function fallbackStyles() {
+  function restoreVisibility() {
+    if (host.hasAttribute("hidden")) host.removeAttribute("hidden");
+    if (link.hasAttribute("hidden")) link.removeAttribute("hidden");
+    // Critical appearance survives even if extension-owned style nodes disappear.
     const hostRules = {
       all: "initial",
       position: "fixed",
@@ -238,27 +240,37 @@
       display: "block",
       visibility: "visible",
       opacity: "1",
+      height: "auto",
+      "max-height": "none",
+      width: "max-content",
+      "max-width": "calc(100vw - 32px)",
+      "box-sizing": "border-box",
+      overflow: "visible",
       "pointer-events": "auto",
       background: "transparent",
       "z-index": "2147483646",
     };
     const linkRules = {
-      display: "inline-block",
+      display: "inline-flex",
+      "align-items": "center",
+      gap: "8px",
+      "box-sizing": "border-box",
+      "max-width": "100%",
+      visibility: "visible",
+      opacity: "1",
       padding: "10px 14px",
-      background: "#2c2c2c",
+      background: "var(--kp-bg, #2c2c2c)",
       color: "#f5f5f5",
-      border: "1px solid #595959",
+      border: "1px solid var(--kp-border, #595959)",
       "border-radius": "10px",
       "text-decoration": "none",
       "touch-action": "none",
       "user-select": "none",
-      cursor: "grab",
+      cursor: "var(--kp-cursor, grab)",
       font: '600 13px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif',
     };
-    for (const [name, value] of Object.entries(hostRules))
-      host.style.setProperty(name, value, "important");
-    for (const [name, value] of Object.entries(linkRules))
-      link.style.setProperty(name, value);
+    setRules(host, hostRules, "important");
+    setRules(link, linkRules);
   }
 
   function addStyles(shadow) {
@@ -266,8 +278,11 @@
     if (existing?.textContent === STYLE) return;
     if (existing) existing.remove();
     // Tampermonkey's API can insert styles on CSP-restricted pages.
-    const style = GM_addElement(shadow, "style", { textContent: STYLE });
-    if (!style) fallbackStyles();
+    try {
+      GM_addElement(shadow, "style", { textContent: STYLE });
+    } catch {
+      // The manager can still be reconnecting after a history restoration.
+    }
   }
 
   function destination(href) {
@@ -295,7 +310,6 @@
       "Открыть на kinokino.vip. Зажмите и перетащите, чтобы переместить кнопку.";
     link.draggable = false;
     link.referrerPolicy = "no-referrer";
-    addStyles(host.shadowRoot);
     // Re-read the URL at click time if navigation occurred between refreshes.
     link.onclick = activateLink;
     link.onauxclick = activateLink;
@@ -313,6 +327,7 @@
       attributes: true,
       attributeFilter: ["style", "hidden", "class"],
     });
+    queueExtensionRefresh();
   }
 
   function update(event) {
@@ -342,29 +357,112 @@
     cancelDrag();
     if (frame !== null) cancelAnimationFrame(frame);
     frame = null;
-    window.clearInterval(timer);
+    if (refreshTimer !== null) window.clearTimeout(refreshTimer);
+    refreshTimer = null;
+    positionRefreshPending = true;
   }
 
   function resume() {
     pause();
-    position = readPosition();
+    ensureWatchdog();
     update();
-    timer = window.setInterval(update, 800);
+    queueExtensionRefresh();
     scheduleUpdate();
+  }
+
+  function ensureWatchdog() {
+    if (timer === null) timer = window.setInterval(watchdog, 800);
+  }
+
+  function watchdog() {
+    if (document.hidden) return;
+    update();
+    if (positionRefreshPending || !menusRegistered || needsStyles())
+      queueExtensionRefresh();
+  }
+
+  function needsStyles() {
+    return (
+      host?.isConnected &&
+      host.shadowRoot.querySelector("style")?.textContent !== STYLE
+    );
+  }
+
+  function queueExtensionRefresh() {
+    if (refreshTimer !== null) return;
+    refreshTimer = window.setTimeout(refreshFromExtension, 0);
+  }
+
+  function persistPosition(value) {
+    position = value;
+    positionWritePending = true;
+    try {
+      GM_setValue(POSITION_KEY, value);
+      positionWritePending = false;
+    } catch {
+      positionRefreshPending = true;
+      queueExtensionRefresh();
+    }
+  }
+
+  function refreshFromExtension() {
+    refreshTimer = null;
+    if (document.hidden) return;
+    // Run after lifecycle dispatch: Tampermonkey reconnects its ports on pageshow.
+    if (positionRefreshPending || positionWritePending) {
+      try {
+        if (positionWritePending) {
+          GM_setValue(POSITION_KEY, position);
+          positionWritePending = false;
+        } else {
+          position = readPosition();
+        }
+        positionRefreshPending = false;
+      } catch {
+        positionRefreshPending = true;
+      }
+    }
+    registerMenus();
+    if (needsStyles()) addStyles(host.shadowRoot);
+    update();
+  }
+
+  function registerMenus() {
+    if (menusRegistered) return;
+    try {
+      GM_registerMenuCommand("Показать кнопку Kinokino (1.3.1)", resume, {
+        id: HOST_ID,
+      });
+      GM_registerMenuCommand("Сбросить положение кнопки", resetPosition, {
+        id: `${HOST_ID}-reset`,
+      });
+      menusRegistered = true;
+    } catch {
+      // DOM repair does not depend on the extension's menu connection.
+    }
   }
 
   function onVisibility() {
     if (!document.hidden) resume();
   }
 
+  function onPageHide() {
+    pause();
+    menusRegistered = false;
+  }
+
   function stop() {
     pause();
+    window.clearInterval(timer);
+    timer = null;
     documentObserver.disconnect();
     hostObserver?.disconnect();
-    for (const name of ["popstate", "hashchange", "pageshow", "focus"])
-      window.removeEventListener(name, resume);
-    window.removeEventListener("pagehide", pause);
-    document.removeEventListener("visibilitychange", onVisibility);
+    for (const name of ["popstate", "hashchange", "pageshow"])
+      window.removeEventListener(name, resume, true);
+    window.removeEventListener("focus", resume);
+    window.removeEventListener("pagehide", onPageHide, true);
+    document.removeEventListener("visibilitychange", onVisibility, true);
+    document.removeEventListener("resume", resume, true);
     window.removeEventListener("resize", onResize);
   }
 
@@ -375,21 +473,17 @@
 
   if (typeof window[RUNTIME_KEY] === "function") window[RUNTIME_KEY]();
   window[RUNTIME_KEY] = stop;
-  GM_registerMenuCommand("Показать кнопку Kinokino (1.3.0)", resume, {
-    id: HOST_ID,
-  });
-  GM_registerMenuCommand("Сбросить положение кнопки", resetPosition, {
-    id: `${HOST_ID}-reset`,
-  });
   const documentObserver = new MutationObserver(scheduleUpdate);
   documentObserver.observe(document, {
     childList: true,
     subtree: true,
   });
-  for (const name of ["popstate", "hashchange", "pageshow", "focus"])
-    window.addEventListener(name, resume);
-  window.addEventListener("pagehide", pause);
-  document.addEventListener("visibilitychange", onVisibility);
+  for (const name of ["popstate", "hashchange", "pageshow"])
+    window.addEventListener(name, resume, true);
+  window.addEventListener("focus", resume);
+  window.addEventListener("pagehide", onPageHide, true);
+  document.addEventListener("visibilitychange", onVisibility, true);
+  document.addEventListener("resume", resume, true);
   window.addEventListener("resize", onResize);
   // pushState/replaceState do not emit popstate, including in userscript sandboxes.
   resume();

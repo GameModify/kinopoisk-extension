@@ -13,10 +13,14 @@ const source = readFileSync(
 function browser(href, options = {}) {
   const storage = options.storage ?? new Map();
   const storageWrites = [];
+  const bridge = options.bridge ?? {};
+  const apiCalls = [];
+  const timeouts = new Map();
   const frames = new Map();
   const timers = new Map();
   let nextId = 1;
   const events = {};
+  const eventOptions = {};
   const documentEvents = {};
   const menus = new Map();
   const managerStyles = [];
@@ -131,8 +135,17 @@ function browser(href, options = {}) {
     clearInterval(id) {
       timers.delete(id);
     },
-    addEventListener(name, handler) {
+    setTimeout(handler) {
+      const id = nextId++;
+      timeouts.set(id, handler);
+      return id;
+    },
+    clearTimeout(id) {
+      timeouts.delete(id);
+    },
+    addEventListener(name, handler, capture = false) {
       events[name] = handler;
+      eventOptions[name] = capture;
     },
     removeEventListener(name, handler) {
       if (events[name] === handler) delete events[name];
@@ -175,16 +188,24 @@ function browser(href, options = {}) {
       }
     },
     GM_registerMenuCommand(name, callback) {
+      apiCalls.push("menu");
+      if (bridge.menuFails) throw new Error("Disconnected menu port");
       menus.set(name, callback);
     },
     GM_getValue(key, fallback) {
+      apiCalls.push("read");
+      if (bridge.readFails) throw new Error("Disconnected storage port");
       return storage.has(key) ? structuredClone(storage.get(key)) : fallback;
     },
     GM_setValue(key, value) {
+      apiCalls.push("write");
+      if (bridge.writeFails) throw new Error("Disconnected storage port");
       storage.set(key, structuredClone(value));
       storageWrites.push({ key, value: structuredClone(value) });
     },
     GM_addElement(parent, tag, attributes) {
+      apiCalls.push("style");
+      if (bridge.styleFails) throw new Error("Disconnected style port");
       managerStyles.push({ parent, tag, attributes });
       if (options.styleInsertionFails) return null;
       const style = element(tag);
@@ -193,11 +214,18 @@ function browser(href, options = {}) {
       return style;
     },
   };
+  function flush() {
+    const callbacks = Array.from(timeouts.values());
+    timeouts.clear();
+    for (const callback of callbacks) callback();
+  }
   vm.runInNewContext(source, context);
+  flush();
   return {
     window,
     root,
     events,
+    eventOptions,
     documentEvents,
     menus,
     managerStyles,
@@ -205,6 +233,9 @@ function browser(href, options = {}) {
     document,
     storage,
     storageWrites,
+    bridge,
+    apiCalls,
+    flush,
     resize(width, height) {
       html.clientWidth = width;
       html.clientHeight = height;
@@ -271,6 +302,119 @@ test("film and series links retain the complete path, query and fragment", () =>
   }
 });
 
+test("the watchdog repairs a return even when pageshow never reaches the sandbox", () => {
+  const page = browser("https://www.kinopoisk.ru/series/160958/");
+  const host = page.root.firstElementChild;
+  page.events.pagehide({ persisted: true });
+  host.remove();
+  host.setAttribute("hidden", "");
+  page.tick();
+  assert.equal(page.link()?.href, "https://kinokino.vip/series/160958/");
+  assert.equal(host.hasAttribute("hidden"), false);
+  assert.equal(page.timerCount(), 1);
+});
+
+test("a disconnected GM bridge cannot abort history repair or kill the watchdog", () => {
+  const page = browser("https://www.kinopoisk.ru/series/160958/");
+  page.events.pagehide({ persisted: true });
+  page.root.firstElementChild.remove();
+  page.bridge.readFails = true;
+  assert.doesNotThrow(() => page.events.pageshow({ persisted: true }));
+  page.flush();
+  assert.equal(page.link()?.href, "https://kinokino.vip/series/160958/");
+  assert.equal(page.timerCount(), 1);
+});
+
+test("startup stays visible when all extension bridges fail and retries after reconnect", () => {
+  const bridge = {
+    readFails: true,
+    writeFails: true,
+    styleFails: true,
+    menuFails: true,
+  };
+  const page = browser("https://www.kinopoisk.ru/series/160958/", { bridge });
+  assert.equal(page.link().href, "https://kinokino.vip/series/160958/");
+  assert.equal(page.timerCount(), 1);
+  assert.equal(page.link().style.getPropertyValue("display"), "inline-flex");
+  Object.assign(bridge, {
+    readFails: false,
+    writeFails: false,
+    styleFails: false,
+    menuFails: false,
+  });
+  page.tick();
+  page.flush();
+  assert.ok(page.menus.has("Показать кнопку Kinokino (1.3.1)"));
+  assert.equal(page.managerStyles.length, 1);
+});
+
+test("critical position and appearance survive loss of the manager stylesheet", () => {
+  const page = browser("https://www.kinopoisk.ru/series/160958/");
+  const host = page.root.firstElementChild;
+  host.shadowRoot.querySelector("style").remove();
+  page.bridge.styleFails = true;
+  host.style.setProperty("left", "auto", "important");
+  host.style.setProperty("top", "auto", "important");
+  page.events.pagehide({ persisted: true });
+  page.tick();
+  page.flush();
+  assert.equal(host.style.getPropertyValue("left"), "var(--kp-left, 16px)");
+  assert.equal(host.style.getPropertyValue("top"), "var(--kp-top, 50%)");
+  assert.equal(page.link().style.getPropertyValue("color"), "#f5f5f5");
+  assert.equal(host.shadowRoot.querySelector("style"), null);
+  page.bridge.styleFails = false;
+  page.tick();
+  page.flush();
+  assert.ok(host.shadowRoot.querySelector("style"));
+});
+
+test("lifecycle events defer GM calls and leave element focus outside capture", () => {
+  const page = browser("https://www.kinopoisk.ru/series/160958/");
+  const calls = page.apiCalls.length;
+  page.events.pagehide({ persisted: true });
+  page.documentEvents.visibilitychange();
+  page.events.pageshow({ persisted: true });
+  assert.equal(page.apiCalls.length, calls);
+  assert.equal(page.eventOptions.pageshow, true);
+  assert.equal(page.eventOptions.focus, false);
+  page.flush();
+  assert.ok(page.apiCalls.length > calls);
+});
+
+test("failed position writes still release capture and are retried without losing the drag", () => {
+  const page = browser("https://www.kinopoisk.ru/film/326/");
+  page.bridge.writeFails = true;
+  page.pointer("pointerdown", 40, 355);
+  page.pointer("pointermove", 440, 455);
+  assert.doesNotThrow(() => page.pointer("pointerup", 440, 455));
+  assert.equal(page.link().hasPointerCapture(1), false);
+  assert.equal(page.root.firstElementChild.getBoundingClientRect().left, 416);
+  page.flush();
+  assert.equal(page.storageWrites.length, 0);
+  page.bridge.writeFails = false;
+  page.tick();
+  page.flush();
+  assert.equal(page.storageWrites.length, 1);
+  assert.equal(page.root.firstElementChild.getBoundingClientRect().left, 416);
+  page.bridge.writeFails = true;
+  assert.doesNotThrow(() => page.menus.get("Сбросить положение кнопки")());
+  assert.equal(page.root.firstElementChild.getBoundingClientRect().left, 16);
+});
+
+test("a temporarily unavailable saved position is loaded after bridge recovery", () => {
+  const bridge = { readFails: true };
+  const storage = new Map([["button-position", { x: 0.75, y: 0.3 }]]);
+  const page = browser("https://www.kinopoisk.ru/film/326/", {
+    bridge,
+    storage,
+  });
+  assert.equal(page.root.firstElementChild.getBoundingClientRect().left, 16);
+  bridge.readFails = false;
+  page.tick();
+  page.flush();
+  assert.equal(page.root.firstElementChild.getBoundingClientRect().left, 817);
+});
+
 test("userscript requests DOM isolation and CSP-aware styling", () => {
   assert.match(source, /^\/\/ @sandbox\s+DOM$/m);
   assert.match(source, /^\/\/ @grant\s+GM_addElement$/m);
@@ -288,7 +432,7 @@ test("document-start waits for the root and still registers its diagnostic menu"
   });
   assert.equal(page.link(), undefined);
   assert.equal(page.observed(), page.document);
-  assert.ok(page.menus.has("Показать кнопку Kinokino (1.3.0)"));
+  assert.ok(page.menus.has("Показать кнопку Kinokino (1.3.1)"));
   page.ready();
   assert.equal(page.link().href, "https://kinokino.vip/series/160958/");
 });
@@ -301,7 +445,10 @@ test("critical button styles survive an unsuccessful manager style insertion", (
     value: "fixed",
     priority: "important",
   });
-  assert.equal(page.link().style.properties.get("background").value, "#2c2c2c");
+  assert.equal(
+    page.link().style.properties.get("background").value,
+    "var(--kp-bg, #2c2c2c)",
+  );
 });
 
 test("the neutral floating button stays inside body without replacing the header", () => {
@@ -337,7 +484,7 @@ test("cosmetic hiding and hidden attributes are repaired without repeated writes
 test("the Tampermonkey menu restores a removed button", () => {
   const page = browser("https://www.kinopoisk.ru/series/160958/");
   page.root.children[0].remove();
-  page.menus.get("Показать кнопку Kinokino (1.3.0)")();
+  page.menus.get("Показать кнопку Kinokino (1.3.1)")();
   assert.equal(page.link().href, "https://kinokino.vip/series/160958/");
   assert.equal(page.timerCount(), 1);
 });
@@ -430,6 +577,7 @@ test("Back to a cached page reloads the position saved on another page", () => {
   second.pointer("pointerup", 440, 455);
   second.events.pagehide();
   first.events.pageshow({ persisted: true });
+  first.flush();
   const rect = first.root.firstElementChild.getBoundingClientRect();
   assert.equal(rect.left, 416);
   assert.equal(rect.top, 440);
@@ -500,11 +648,11 @@ test("click refreshes a stale link immediately and cancels it on an unrelated ro
   assert.equal(page.link(), undefined);
 });
 
-test("history restoration repairs the button and restarts a single polling timer", () => {
+test("history restoration repairs the button and retains a single polling timer", () => {
   const page = browser("https://www.kinopoisk.ru/series/160958/");
   const host = page.root.firstElementChild;
   page.events.pagehide();
-  assert.equal(page.timerCount(), 0);
+  assert.equal(page.timerCount(), 1);
   host.remove();
   host.setAttribute("hidden", "");
   page.events.pageshow({ persisted: true });
