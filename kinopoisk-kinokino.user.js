@@ -1,59 +1,121 @@
 // ==UserScript==
 // @name         Кинопоиск → Kinokino — Смотреть бесплатно
 // @namespace    https://github.com/GameModify/kinopoisk-extension
-// @version      1.0.0
-// @description  Кнопка слева на страницах фильмов и сериалов: открыть тот же адрес на kinokino.vip.
+// @version      1.1.0
+// @description  Панель над шапкой фильма или сериала: открыть тот же адрес на kinokino.vip.
 // @match        https://www.kinopoisk.ru/*
 // @match        https://kinopoisk.ru/*
-// @run-at       document-end
-// @grant        none
+// @run-at       document-start
+// @sandbox      DOM
+// @grant        GM_addElement
+// @grant        GM_registerMenuCommand
 // @noframes
 // ==/UserScript==
 
 (() => {
   "use strict";
 
-  const HOST_ID = "kinopoisk-kinokino-button";
+  const HOST_ID = "kp-title-tools";
   const STYLE = `
     :host {
       all: initial !important;
-      position: fixed !important;
-      left: 16px !important;
-      top: 45% !important;
-      z-index: 2147483646 !important;
+      position: relative !important;
       display: block !important;
-      color-scheme: light !important;
+      visibility: visible !important;
+      opacity: 1 !important;
+      box-sizing: border-box !important;
+      width: 100% !important;
+      padding: 10px 16px !important;
+      background: #181818 !important;
+      border-bottom: 1px solid #303030 !important;
+      text-align: center !important;
+      color-scheme: dark !important;
     }
     a {
-      display: flex;
+      display: inline-flex;
       align-items: center;
-      gap: 10px;
+      gap: 8px;
       box-sizing: border-box;
-      padding: 15px 19px;
-      border: 1px solid rgba(255,255,255,.24);
-      border-radius: 16px;
-      background: linear-gradient(115deg, #ff6500, #ed3800);
-      color: #fff;
-      font: 700 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+      padding: 9px 15px;
+      border: 1px solid #626262;
+      border-radius: 8px;
+      background: #2c2c2c;
+      color: #f5f5f5;
+      font: 600 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
       text-decoration: none;
-      box-shadow: 0 6px 24px rgba(0,0,0,.24);
-      transition: filter .15s, transform .15s;
       -webkit-tap-highlight-color: transparent;
     }
-    a::before { content: "▶"; font-size: 16px; }
-    a:hover { filter: brightness(1.1); transform: translateY(-2px); }
-    a:focus-visible { outline: 3px solid #1677ff; outline-offset: 4px; }
-    a:active { transform: translateY(0); }
+    a::before { content: "▶"; font-size: 11px; }
+    a:hover { background: #3b3b3b; border-color: #929292; }
+    a:focus-visible { outline: 2px solid #fff; outline-offset: 3px; }
+    a:active { background: #222; }
     @media (max-width: 700px) {
-      :host { top: auto !important; bottom: 24px !important; left: 12px !important; }
-      a { padding: 12px 15px; font-size: 13px; }
+      :host { padding: 8px 12px !important; }
+      a { padding: 9px 14px; font-size: 13px; }
     }
-    @media (prefers-reduced-motion: reduce) { a { transition: none; } }
   `;
 
   let host;
   let link;
   let pending = false;
+
+  function restoreVisibility() {
+    if (host.hasAttribute("hidden")) host.removeAttribute("hidden");
+    const rules = {
+      display: "block",
+      visibility: "visible",
+      opacity: "1",
+      position: "relative",
+      height: "auto",
+      "max-height": "none",
+      overflow: "visible",
+      "pointer-events": "auto",
+    };
+    for (const [name, value] of Object.entries(rules)) {
+      if (
+        host.style.getPropertyValue(name) !== value ||
+        host.style.getPropertyPriority(name) !== "important"
+      ) {
+        host.style.setProperty(name, value, "important");
+      }
+    }
+  }
+
+  function fallbackStyles() {
+    const hostRules = {
+      all: "initial",
+      position: "relative",
+      margin: "0",
+      padding: "10px 16px",
+      border: "0",
+      display: "block",
+      visibility: "visible",
+      opacity: "1",
+      "pointer-events": "auto",
+      background: "#181818",
+      "text-align": "center",
+    };
+    const linkRules = {
+      display: "inline-block",
+      padding: "9px 15px",
+      background: "#2c2c2c",
+      color: "#f5f5f5",
+      border: "1px solid #626262",
+      "border-radius": "8px",
+      "text-decoration": "none",
+      font: '600 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif',
+    };
+    for (const [name, value] of Object.entries(hostRules))
+      host.style.setProperty(name, value, "important");
+    for (const [name, value] of Object.entries(linkRules))
+      link.style.setProperty(name, value);
+  }
+
+  function addStyles(shadow) {
+    // Tampermonkey's API can insert styles on CSP-restricted pages.
+    const style = GM_addElement(shadow, "style", { textContent: STYLE });
+    if (!style) fallbackStyles();
+  }
 
   function destination(href) {
     const url = new URL(href);
@@ -64,19 +126,23 @@
   }
 
   function createButton() {
-    host = document.createElement("div");
+    // A normal-flow tools element inside body avoids generic html > div filters.
+    host = document.createElement("kp-title-tools");
     host.id = HOST_ID;
     const shadow = host.attachShadow({ mode: "open" });
-    const style = document.createElement("style");
-    style.textContent = STYLE;
     link = document.createElement("a");
     link.textContent = "Смотреть бесплатно";
     link.title = "Открыть эту страницу на kinokino.vip";
     link.referrerPolicy = "no-referrer";
-    shadow.append(style, link);
+    shadow.append(link);
+    addStyles(shadow);
     // Re-read the URL at click time if navigation occurred between refreshes.
     link.addEventListener("click", update);
     link.addEventListener("auxclick", update);
+    new MutationObserver(scheduleUpdate).observe(host, {
+      attributes: true,
+      attributeFilter: ["style", "hidden", "class"],
+    });
   }
 
   function update(event) {
@@ -86,9 +152,11 @@
       if (host) host.remove();
       return;
     }
+    if (!document.body) return;
     if (!host) createButton();
     if (link.href !== href) link.href = href;
-    if (!host.isConnected) document.documentElement.append(host);
+    if (document.body.firstElementChild !== host) document.body.prepend(host);
+    restoreVisibility();
   }
 
   function scheduleUpdate() {
@@ -100,9 +168,14 @@
     });
   }
 
+  GM_registerMenuCommand("Показать кнопку Kinokino (1.1.0)", () => {
+    update();
+    if (host?.isConnected)
+      host.scrollIntoView({ block: "start", behavior: "instant" });
+  });
   if (document.getElementById(HOST_ID)) return;
   update();
-  new MutationObserver(scheduleUpdate).observe(document.documentElement, {
+  new MutationObserver(scheduleUpdate).observe(document, {
     childList: true,
     subtree: true,
   });

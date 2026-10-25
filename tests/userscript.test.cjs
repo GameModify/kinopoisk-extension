@@ -10,12 +10,18 @@ const source = readFileSync(
 
 // Minimal DOM harness: execute the distributed userscript itself, including
 // its navigation handlers, observer, timer and click-time URL refresh.
-function browser(href) {
+function browser(href, options = {}) {
   const frames = [];
   const timers = [];
   const events = {};
-  let mutation;
-  const root = element("html");
+  const menus = new Map();
+  const managerStyles = [];
+  let observed;
+  const mutations = [];
+  const root = element("body");
+  const html = element("html");
+  html.append(root);
+  if (options.existingHeader) root.append(element("header"));
 
   function element(tag) {
     return {
@@ -23,6 +29,40 @@ function browser(href) {
       children: [],
       events: {},
       isConnected: false,
+      attributes: new Map(),
+      style: {
+        properties: new Map(),
+        setProperty(name, value, priority) {
+          this.properties.set(name, { value, priority });
+        },
+        getPropertyValue(name) {
+          return this.properties.get(name)?.value ?? "";
+        },
+        getPropertyPriority(name) {
+          return this.properties.get(name)?.priority ?? "";
+        },
+      },
+      setAttribute(name, value) {
+        this.attributes.set(name, value);
+      },
+      removeAttribute(name) {
+        this.attributes.delete(name);
+      },
+      hasAttribute(name) {
+        return this.attributes.has(name);
+      },
+      get firstElementChild() {
+        return this.children[0];
+      },
+      scrollIntoView() {
+        this.scrolledIntoView = true;
+      },
+      prepend(child) {
+        child.remove();
+        child.parent = this;
+        child.isConnected = true;
+        this.children.unshift(child);
+      },
       append(...children) {
         for (const child of children) {
           child.parent = this;
@@ -55,37 +95,61 @@ function browser(href) {
     },
   };
   const document = {
-    documentElement: root,
+    documentElement: options.documentReady === false ? null : html,
+    body: options.documentReady === false ? null : root,
     createElement: element,
     getElementById: (id) => root.children.find((child) => child.id === id),
   };
-  vm.runInNewContext(source, {
+  const context = {
     URL,
     window,
     document,
     requestAnimationFrame: (handler) => frames.push(handler),
     MutationObserver: class {
       constructor(handler) {
-        mutation = handler;
+        mutations.push(handler);
       }
-      observe() {}
+      observe(target) {
+        observed = target;
+      }
     },
-  });
+    GM_registerMenuCommand(name, callback) {
+      menus.set(name, callback);
+    },
+    GM_addElement(parent, tag, attributes) {
+      managerStyles.push({ parent, tag, attributes });
+      if (options.styleInsertionFails) return null;
+      const style = element(tag);
+      Object.assign(style, attributes);
+      parent.append(style);
+      return style;
+    },
+  };
+  vm.runInNewContext(source, context);
   return {
     window,
     root,
     events,
+    menus,
+    managerStyles,
+    observed: () => observed,
+    document,
+    ready() {
+      document.documentElement = html;
+      document.body = root;
+      this.mutate();
+    },
     tick() {
       for (const handler of timers) handler();
     },
     mutate() {
-      mutation();
+      for (const mutation of mutations) mutation();
       for (const handler of frames.splice(0)) handler();
     },
     link: () =>
       root.children[0]?.shadowRoot.children.find((child) => child.tag === "a"),
     rerun() {
-      vm.runInNewContext(source, { URL, window, document });
+      vm.runInNewContext(source, context);
     },
   };
 }
@@ -108,6 +172,77 @@ test("film and series links retain the complete path, query and fragment", () =>
     assert.equal(page.link().textContent, "Смотреть бесплатно");
     assert.equal(page.link().referrerPolicy, "no-referrer");
   }
+});
+
+test("userscript requests DOM isolation and CSP-aware styling", () => {
+  assert.match(source, /^\/\/ @sandbox\s+DOM$/m);
+  assert.match(source, /^\/\/ @grant\s+GM_addElement$/m);
+  assert.doesNotMatch(source, /^\/\/ @grant\s+none$/m);
+  const page = browser("https://www.kinopoisk.ru/series/160958/");
+  const insertion = page.managerStyles[0];
+  assert.equal(insertion.tag, "style");
+  assert.equal(insertion.parent, page.root.children[0].shadowRoot);
+  assert.match(insertion.attributes.textContent, /position: relative/);
+});
+
+test("document-start waits for the root and still registers its diagnostic menu", () => {
+  const page = browser("https://www.kinopoisk.ru/series/160958/", {
+    documentReady: false,
+  });
+  assert.equal(page.link(), undefined);
+  assert.equal(page.observed(), page.document);
+  assert.ok(page.menus.has("Показать кнопку Kinokino (1.1.0)"));
+  page.ready();
+  assert.equal(page.link().href, "https://kinokino.vip/series/160958/");
+});
+
+test("critical button styles survive an unsuccessful manager style insertion", () => {
+  const page = browser("https://www.kinopoisk.ru/series/160958/", {
+    styleInsertionFails: true,
+  });
+  assert.deepEqual(page.root.children[0].style.properties.get("position"), {
+    value: "relative",
+    priority: "important",
+  });
+  assert.equal(page.link().style.properties.get("background").value, "#2c2c2c");
+});
+
+test("the neutral tools panel precedes an existing header inside body", () => {
+  const page = browser("https://www.kinopoisk.ru/series/160958/", {
+    existingHeader: true,
+  });
+  const host = page.root.firstElementChild;
+  assert.equal(host.tag, "kp-title-tools");
+  assert.equal(host.parent, page.document.body);
+  assert.notEqual(host.parent, page.document.documentElement);
+  assert.equal(host.hasAttribute("popover"), false);
+  assert.equal(page.root.children[1].tag, "header");
+});
+
+test("cosmetic hiding and hidden attributes are repaired without repeated writes", () => {
+  const page = browser("https://www.kinopoisk.ru/series/160958/");
+  const host = page.root.firstElementChild;
+  host.style.setProperty("display", "none", "important");
+  host.style.setProperty("opacity", "0", "important");
+  host.setAttribute("hidden", "");
+  page.mutate();
+  assert.equal(host.style.getPropertyValue("display"), "block");
+  assert.equal(host.style.getPropertyValue("opacity"), "1");
+  assert.equal(host.hasAttribute("hidden"), false);
+  let writes = 0;
+  host.style.setProperty = () => {
+    writes++;
+  };
+  page.tick();
+  assert.equal(writes, 0);
+});
+
+test("the Tampermonkey menu restores a removed button", () => {
+  const page = browser("https://www.kinopoisk.ru/series/160958/");
+  page.root.children[0].remove();
+  page.menus.get("Показать кнопку Kinokino (1.1.0)")();
+  assert.equal(page.link().href, "https://kinokino.vip/series/160958/");
+  assert.equal(page.root.firstElementChild.scrolledIntoView, true);
 });
 
 test("unrelated routes and lookalike hostnames do not get a button", () => {
