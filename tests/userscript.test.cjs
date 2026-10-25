@@ -11,6 +11,8 @@ const source = readFileSync(
 // Minimal DOM harness: execute the distributed userscript itself, including
 // its navigation handlers, observer, timer and click-time URL refresh.
 function browser(href, options = {}) {
+  const storage = options.storage ?? new Map();
+  const storageWrites = [];
   const frames = new Map();
   const timers = new Map();
   let nextId = 1;
@@ -22,6 +24,8 @@ function browser(href, options = {}) {
   const mutations = new Set();
   const root = element("body");
   const html = element("html");
+  html.clientWidth = options.width ?? 1280;
+  html.clientHeight = options.height ?? 720;
   html.append(root);
   if (options.existingHeader) root.append(element("header"));
 
@@ -32,6 +36,33 @@ function browser(href, options = {}) {
       events: {},
       isConnected: false,
       attributes: new Map(),
+      captured: new Set(),
+      setPointerCapture(id) {
+        this.captured.add(id);
+      },
+      hasPointerCapture(id) {
+        return this.captured.has(id);
+      },
+      releasePointerCapture(id) {
+        this.captured.delete(id);
+        this.onlostpointercapture?.({ pointerId: id });
+      },
+      getBoundingClientRect() {
+        const left =
+          Number.parseFloat(this.style.getPropertyValue("--kp-left")) || 0;
+        const top =
+          Number.parseFloat(this.style.getPropertyValue("--kp-top")) || 0;
+        const width = options.buttonWidth ?? 180;
+        const height = options.buttonHeight ?? 40;
+        return {
+          left,
+          top,
+          width,
+          height,
+          right: left + width,
+          bottom: top + height,
+        };
+      },
       style: {
         properties: new Map(),
         setProperty(name, value, priority) {
@@ -146,6 +177,13 @@ function browser(href, options = {}) {
     GM_registerMenuCommand(name, callback) {
       menus.set(name, callback);
     },
+    GM_getValue(key, fallback) {
+      return storage.has(key) ? structuredClone(storage.get(key)) : fallback;
+    },
+    GM_setValue(key, value) {
+      storage.set(key, structuredClone(value));
+      storageWrites.push({ key, value: structuredClone(value) });
+    },
     GM_addElement(parent, tag, attributes) {
       managerStyles.push({ parent, tag, attributes });
       if (options.styleInsertionFails) return null;
@@ -165,6 +203,31 @@ function browser(href, options = {}) {
     managerStyles,
     observed: () => observed,
     document,
+    storage,
+    storageWrites,
+    resize(width, height) {
+      html.clientWidth = width;
+      html.clientHeight = height;
+      events.resize();
+    },
+    pointer(type, x, y, extra = {}) {
+      const event = {
+        button: 0,
+        pointerId: 1,
+        isPrimary: true,
+        clientX: x,
+        clientY: y,
+        detail: 1,
+        prevented: false,
+        preventDefault() {
+          this.prevented = true;
+        },
+        stopPropagation() {},
+        ...extra,
+      };
+      this.link()[`on${type}`](event);
+      return event;
+    },
     timerCount: () => timers.size,
     ready() {
       document.documentElement = html;
@@ -225,7 +288,7 @@ test("document-start waits for the root and still registers its diagnostic menu"
   });
   assert.equal(page.link(), undefined);
   assert.equal(page.observed(), page.document);
-  assert.ok(page.menus.has("Показать кнопку Kinokino (1.2.0)"));
+  assert.ok(page.menus.has("Показать кнопку Kinokino (1.3.0)"));
   page.ready();
   assert.equal(page.link().href, "https://kinokino.vip/series/160958/");
 });
@@ -274,9 +337,114 @@ test("cosmetic hiding and hidden attributes are repaired without repeated writes
 test("the Tampermonkey menu restores a removed button", () => {
   const page = browser("https://www.kinopoisk.ru/series/160958/");
   page.root.children[0].remove();
-  page.menus.get("Показать кнопку Kinokino (1.2.0)")();
+  page.menus.get("Показать кнопку Kinokino (1.3.0)")();
   assert.equal(page.link().href, "https://kinokino.vip/series/160958/");
   assert.equal(page.timerCount(), 1);
+});
+
+test("the initial position is on the left at the vertical midpoint without saving", () => {
+  const page = browser("https://www.kinopoisk.ru/film/326/");
+  const rect = page.root.firstElementChild.getBoundingClientRect();
+  assert.equal(rect.left, 16);
+  assert.equal(rect.top, 340);
+  assert.equal(page.storageWrites.length, 0);
+});
+
+test("dragging saves the position once and blocks the following navigation click", () => {
+  const page = browser("https://www.kinopoisk.ru/film/326/");
+  page.pointer("pointerdown", 40, 355);
+  page.pointer("pointermove", 440, 455);
+  assert.equal(page.storageWrites.length, 0);
+  page.tick();
+  assert.equal(page.root.firstElementChild.getBoundingClientRect().left, 416);
+  page.pointer("pointerup", 440, 455);
+  assert.equal(page.storageWrites.length, 1);
+  assert.equal(page.pointer("click", 440, 455).prevented, true);
+  assert.equal(page.pointer("click", 440, 455, { detail: 0 }).prevented, false);
+  const nextPage = browser("https://kinopoisk.ru/series/160958/", {
+    storage: page.storage,
+  });
+  const rect = nextPage.root.firstElementChild.getBoundingClientRect();
+  assert.equal(rect.left, 416);
+  assert.equal(rect.top, 440);
+});
+
+test("small movements remain ordinary clicks and never save a position", () => {
+  const page = browser("https://www.kinopoisk.ru/film/326/");
+  page.pointer("pointerdown", 40, 355);
+  page.pointer("pointermove", 42, 356);
+  page.pointer("pointerup", 42, 356);
+  assert.equal(page.pointer("click", 42, 356).prevented, false);
+  assert.equal(page.storageWrites.length, 0);
+});
+
+test("touch dragging is bounded and restored inside a smaller viewport", () => {
+  const page = browser("https://www.kinopoisk.ru/film/326/");
+  page.pointer("pointerdown", 40, 355, { pointerType: "touch" });
+  page.pointer("pointermove", 9000, 9000, { pointerType: "touch" });
+  page.pointer("pointerup", 9000, 9000, { pointerType: "touch" });
+  let rect = page.root.firstElementChild.getBoundingClientRect();
+  assert.equal(rect.right, 1264);
+  assert.equal(rect.bottom, 704);
+  page.resize(390, 500);
+  rect = page.root.firstElementChild.getBoundingClientRect();
+  assert.equal(rect.left, 198);
+  assert.equal(rect.top, 448);
+  assert.equal(page.storageWrites.length, 1);
+});
+
+test("cancelled drags revert without saving; the menu resets a saved position", () => {
+  const page = browser("https://www.kinopoisk.ru/film/326/");
+  page.pointer("pointerdown", 40, 355);
+  page.pointer("pointermove", 300, 300);
+  page.pointer("pointercancel", 300, 300);
+  assert.equal(page.root.firstElementChild.getBoundingClientRect().left, 16);
+  assert.equal(page.storageWrites.length, 0);
+  page.pointer("pointerdown", 40, 355);
+  page.pointer("pointermove", 400, 300);
+  page.pointer("pointerup", 400, 300);
+  page.menus.get("Сбросить положение кнопки")();
+  assert.equal(page.storage.get("button-position"), null);
+  assert.equal(page.root.firstElementChild.getBoundingClientRect().top, 340);
+});
+
+test("invalid stored coordinates are ignored and right-click cannot start a drag", () => {
+  const storage = new Map([["button-position", { x: -1, y: Number.NaN }]]);
+  const page = browser("https://www.kinopoisk.ru/film/326/", { storage });
+  assert.equal(page.root.firstElementChild.getBoundingClientRect().left, 16);
+  page.pointer("pointerdown", 40, 355, { button: 2 });
+  page.pointer("pointermove", 400, 400);
+  page.pointer("pointerup", 400, 400);
+  assert.equal(page.storageWrites.length, 0);
+});
+
+test("Back to a cached page reloads the position saved on another page", () => {
+  const storage = new Map();
+  const first = browser("https://www.kinopoisk.ru/film/326/", { storage });
+  first.events.pagehide();
+  const second = browser("https://www.kinopoisk.ru/series/160958/", {
+    storage,
+  });
+  second.pointer("pointerdown", 40, 355);
+  second.pointer("pointermove", 440, 455);
+  second.pointer("pointerup", 440, 455);
+  second.events.pagehide();
+  first.events.pageshow({ persisted: true });
+  const rect = first.root.firstElementChild.getBoundingClientRect();
+  assert.equal(rect.left, 416);
+  assert.equal(rect.top, 440);
+  assert.equal(first.timerCount(), 1);
+});
+
+test("a secondary pointer cannot cancel the primary drag", () => {
+  const page = browser("https://www.kinopoisk.ru/film/326/");
+  page.pointer("pointerdown", 40, 355);
+  page.pointer("pointermove", 440, 455);
+  page.pointer("pointercancel", 0, 0, { pointerId: 2, isPrimary: false });
+  page.pointer("lostpointercapture", 0, 0, { pointerId: 2, isPrimary: false });
+  page.pointer("pointerup", 440, 455);
+  assert.equal(page.storageWrites.length, 1);
+  assert.equal(page.root.firstElementChild.getBoundingClientRect().left, 416);
 });
 
 test("unrelated routes and lookalike hostnames do not get a button", () => {
