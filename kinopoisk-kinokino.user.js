@@ -11,9 +11,9 @@
 // ==/UserScript==
 
 (() => {
-  'use strict';
+  "use strict";
 
-  const HOST_ID = 'kinopoisk-kinokino-button';
+  const HOST_ID = "kinopoisk-kinokino-button";
   const STYLE = `
     :host {
       all: initial !important;
@@ -57,25 +57,26 @@
 
   function destination(href) {
     const url = new URL(href);
-    if (!['kinopoisk.ru', 'www.kinopoisk.ru'].includes(url.hostname)) return null;
+    if (!["kinopoisk.ru", "www.kinopoisk.ru"].includes(url.hostname))
+      return null;
     if (!/^\/(film|series)\/\d+(?:\/|$)/.test(url.pathname)) return null;
     return `https://kinokino.vip${url.pathname}${url.search}${url.hash}`;
   }
 
   function createButton() {
-    host = document.createElement('div');
+    host = document.createElement("div");
     host.id = HOST_ID;
-    const shadow = host.attachShadow({ mode: 'open' });
-    const style = document.createElement('style');
+    const shadow = host.attachShadow({ mode: "open" });
+    const style = document.createElement("style");
     style.textContent = STYLE;
-    link = document.createElement('a');
-    link.textContent = 'Смотреть бесплатно';
-    link.title = 'Открыть эту страницу на kinokino.vip';
-    link.referrerPolicy = 'no-referrer';
+    link = document.createElement("a");
+    link.textContent = "Смотреть бесплатно";
+    link.title = "Открыть эту страницу на kinokino.vip";
+    link.referrerPolicy = "no-referrer";
     shadow.append(style, link);
     // Re-read the URL at click time if navigation occurred between refreshes.
-    link.addEventListener('click', update);
-    link.addEventListener('auxclick', update);
+    link.addEventListener("click", update);
+    link.addEventListener("auxclick", update);
   }
 
   function update(event) {
@@ -105,9 +106,9 @@
     childList: true,
     subtree: true,
   });
-  window.addEventListener('popstate', update);
-  window.addEventListener('hashchange', update);
-  window.addEventListener('pageshow', update);
+  window.addEventListener("popstate", update);
+  window.addEventListener("hashchange", update);
+  window.addEventListener("pageshow", update);
   // pushState/replaceState do not emit popstate, including in userscript sandboxes.
   window.setInterval(update, 800);
 })();

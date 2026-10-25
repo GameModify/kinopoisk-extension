@@ -1,0 +1,12 @@
+{
+  "$schema": "https://biomejs.dev/schemas/2.6.3/schema.json",
+  "files": { "includes": ["**", "!**/package-lock.json", "!**/.cache"] },
+  "formatter": { "indentStyle": "space", "indentWidth": 2 },
+  "linter": { "rules": { "preset": "recommended" } },
+  "overrides": [
+    {
+      "includes": ["kinopoisk-kinokino.user.js"],
+      "linter": { "rules": { "suspicious": { "noRedundantUseStrict": "off" } } }
+    }
+  ]
+}
